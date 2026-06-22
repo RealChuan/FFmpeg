@@ -220,6 +220,7 @@ typedef struct HLSContext {
     int first_packet;
     int64_t first_timestamp;
     int64_t cur_timestamp;
+    int64_t start_time;
     AVIOInterruptCB *interrupt_callback;
     AVDictionary *avio_opts;
     AVDictionary *seg_format_opts;
@@ -1960,6 +1961,13 @@ static int64_t select_cur_seq_no(HLSContext *c, struct playlist *pls)
         return seq_no;
     }
 
+    /* If user specified a start time via AVOption, find the segment
+     * that contains that time offset from the playlist start. */
+    if (c->start_time != AV_NOPTS_VALUE) {
+        find_timestamp_in_playlist(c, pls, c->start_time, &seq_no, NULL);
+        return seq_no;
+    }
+
     if (!pls->finished) {
         if (!c->first_packet && /* we are doing a segment selection during playback */
             c->cur_seq_no >= pls->start_seq_no &&
@@ -2322,7 +2330,7 @@ static int hls_read_header(AVFormatContext *s)
             pls->ctx->probesize = s->probesize > 0 ? s->probesize : 1024 * 4;
             pls->ctx->max_analyze_duration = s->max_analyze_duration > 0 ? s->max_analyze_duration : 4 * AV_TIME_BASE;
             pls->ctx->interrupt_callback = s->interrupt_callback;
-            url = av_strdup(pls->segments[0]->url);
+            url = av_strdup(current_segment(pls)->url);
             ret = av_probe_input_buffer(&pls->pb.pub, &in_fmt, url, NULL, 0, 0);
 
             for (int n = 0; n < pls->n_segments; n++)
@@ -2368,7 +2376,7 @@ static int hls_read_header(AVFormatContext *s)
 
         av_dict_copy(&options, c->seg_format_opts, 0);
 
-        ret = avformat_open_input(&pls->ctx, pls->segments[0]->url, in_fmt, &options);
+        ret = avformat_open_input(&pls->ctx, current_segment(pls)->url, in_fmt, &options);
         av_dict_free(&options);
         if (ret < 0)
             return ret;
@@ -2425,6 +2433,28 @@ static int hls_read_header(AVFormatContext *s)
         add_metadata_from_renditions(s, pls, AVMEDIA_TYPE_AUDIO);
         add_metadata_from_renditions(s, pls, AVMEDIA_TYPE_VIDEO);
         add_metadata_from_renditions(s, pls, AVMEDIA_TYPE_SUBTITLE);
+    }
+
+    /* If a start time was specified, set up seeking so that packets
+     * before the start time are discarded during read. */
+    if (c->start_time != AV_NOPTS_VALUE) {
+        c->cur_timestamp = c->start_time;
+        c->first_timestamp = 0;
+        for (i = 0; i < c->n_playlists; i++) {
+            struct playlist *pls = c->playlists[i];
+            pls->seek_timestamp = c->start_time;
+            pls->seek_flags = AVSEEK_FLAG_ANY;
+            pls->seek_stream_index = -1;
+        }
+        /*
+         * Override s->start_time to 0 so that upper layers (ffplay, ffmpeg,
+         * etc.) see the stream's logical start at time 0, even though we
+         * physically started reading from a later segment. This ensures:
+         *   - Seek clamping uses 0 as the lower bound (not the first packet DTS)
+         *   - Mouse click progress bar maps correctly to absolute positions
+         *   - Loop restart goes back to position 0
+         */
+        s->start_time = 0;
     }
 
     update_noheader_flag(s);
@@ -2645,6 +2675,18 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
         av_packet_move_ref(pkt, pls->pkt);
         pkt->stream_index = st->index;
 
+        /*
+         * When a custom start time is specified, force st->start_time to 0
+         * for all main streams. This causes update_stream_timings() to set
+         * ic->start_time = 0, which prevents upper layers from clamping
+         * seeks to the first packet's DTS. Packet timestamps remain in
+         * absolute time so display and seek are consistent.
+         */
+        if (c->start_time != AV_NOPTS_VALUE) {
+            for (int si = 0; si < pls->n_main_streams; si++)
+                pls->main_streams[si]->start_time = 0;
+        }
+
         if (pkt->dts != AV_NOPTS_VALUE)
             c->cur_timestamp = av_rescale_q(pkt->dts,
                                             ist->time_base,
@@ -2732,8 +2774,24 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
         /* Reset the pos, to let the mpegts/mov demuxer know we've seeked. */
         pb->pos = 0;
         /* Flush the packet queue of the subdemuxer. */
-        if (pls->ctx)
+        if (pls->ctx) {
             ff_read_frame_flush(pls->ctx);
+            /* When hls_start_time is used, the first segment's DTS is far
+             * from zero (e.g. 1800s), so pts_wrap_reference gets set to a
+             * positive value. After seeking to a different segment whose
+             * DTS falls below that reference, wrap_timestamp() incorrectly
+             * adds 2^33 to the DTS, making it jump by ~95444 seconds and
+             * causing all subsequent seeks to fail the boundary check.
+             * Reset the wrap reference so it is recomputed from the new
+             * segment's timestamps. */
+            if (c->start_time != AV_NOPTS_VALUE) {
+                for (unsigned k = 0; k < pls->ctx->nb_streams; k++) {
+                    FFStream *const sti = ffstream(pls->ctx->streams[k]);
+                    sti->pts_wrap_reference = AV_NOPTS_VALUE;
+                    sti->pts_wrap_behavior  = AV_PTS_WRAP_IGNORE;
+                }
+            }
+        }
         if (pls->is_subtitle)
             avformat_close_input(&pls->ctx);
 
@@ -2751,6 +2809,21 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
              * specified stream where we should look for the keyframes */
             pls->seek_stream_index = -1;
             pls->seek_flags |= AVSEEK_FLAG_ANY;
+        }
+    }
+
+    /* When hls_start_time is used, the first segment's DTS is far from
+     * zero (e.g. 1800s), causing pts_wrap_reference on both the sub-demuxer
+     * and the hls-level streams to be set to a positive value. After seeking
+     * to a segment whose DTS falls below that reference, wrap_timestamp()
+     * incorrectly adds 2^33 to the DTS, making it jump by ~95444 seconds.
+     * The sub-demuxer streams are reset above; now reset the hls-level
+     * streams so update_wrap_reference() recomputes from the new segment. */
+    if (c->start_time != AV_NOPTS_VALUE) {
+        for (i = 0; i < s->nb_streams; i++) {
+            FFStream *const sti = ffstream(s->streams[i]);
+            sti->pts_wrap_reference = AV_NOPTS_VALUE;
+            sti->pts_wrap_behavior  = AV_PTS_WRAP_IGNORE;
         }
     }
 
@@ -2835,6 +2908,8 @@ static const AVOption hls_options[] = {
         OFFSET(seg_format_opts), AV_OPT_TYPE_DICT, {.str = NULL}, 0, 0, FLAGS},
     {"seg_max_retry", "Maximum number of times to reload a segment on error.",
      OFFSET(seg_max_retry), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, FLAGS},
+    {"start_time", "start time offset in microseconds",
+        OFFSET(start_time), AV_OPT_TYPE_INT64, {.i64 = AV_NOPTS_VALUE}, INT64_MIN, INT64_MAX, FLAGS},
     {NULL}
 };
 

@@ -326,6 +326,7 @@ static int startup_volume = 100;
 static int show_status = -1;
 static int av_sync_type = AV_SYNC_AUDIO_MASTER;
 static int64_t start_time = AV_NOPTS_VALUE;
+static int64_t hls_start_time = AV_NOPTS_VALUE;
 static int64_t duration = AV_NOPTS_VALUE;
 static int fast = 0;
 static int genpts = 0;
@@ -2917,6 +2918,9 @@ static int read_thread(void *arg)
         av_dict_set(&format_opts, "scan_all_pmts", "1", AV_DICT_DONT_OVERWRITE);
         scan_all_pmts_set = 1;
     }
+    if (hls_start_time != AV_NOPTS_VALUE) {
+        av_dict_set_int(&format_opts, "start_time", hls_start_time, 0);
+    }
     err = avformat_open_input(&ic, is->filename, is->iformat, &format_opts);
     if (err < 0) {
         print_error(is->filename, err);
@@ -2925,6 +2929,8 @@ static int read_thread(void *arg)
     }
     if (scan_all_pmts_set)
         av_dict_set(&format_opts, "scan_all_pmts", NULL, AV_DICT_MATCH_CASE);
+    if (hls_start_time != AV_NOPTS_VALUE)
+        av_dict_set(&format_opts, "start_time", NULL, AV_DICT_MATCH_CASE);
     remove_avoptions(&format_opts, codec_opts);
 
     ret = check_avoptions(format_opts);
@@ -3753,6 +3759,7 @@ static const OptionDef options[] = {
     { "vst",                OPT_TYPE_STRING, OPT_EXPERT, { &wanted_stream_spec[AVMEDIA_TYPE_VIDEO] }, "select desired video stream", "stream_specifier" },
     { "sst",                OPT_TYPE_STRING, OPT_EXPERT, { &wanted_stream_spec[AVMEDIA_TYPE_SUBTITLE] }, "select desired subtitle stream", "stream_specifier" },
     { "ss",                 OPT_TYPE_TIME,            0, { &start_time }, "seek to a given position in seconds", "pos" },
+    { "hls_start_time",     OPT_TYPE_TIME,            0, { &hls_start_time }, "set HLS start time offset in seconds", "pos" },
     { "t",                  OPT_TYPE_TIME,            0, { &duration }, "play  \"duration\" seconds of audio/video", "duration" },
     { "bytes",              OPT_TYPE_INT,             0, { &seek_by_bytes }, "seek by bytes 0=off 1=on -1=auto", "val" },
     { "seek_interval",      OPT_TYPE_FLOAT,           0, { &seek_interval }, "set seek interval for left/right keys, in seconds", "seconds" },
